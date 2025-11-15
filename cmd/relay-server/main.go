@@ -14,7 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/portal-project/portal-gateway/portal/config"
+	"github.com/portal-project/portal-gateway/portal/metrics"
 	"github.com/portal-project/portal-gateway/portal/middleware"
 	"github.com/portal-project/portal-gateway/portal/quota"
 )
@@ -145,12 +148,16 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	// Create quota middleware
 	quotaMiddleware := quota.NewQuotaMiddleware(quotaManager)
 
+	// Create metrics middleware
+	metricsMiddleware := metrics.NewMetricsMiddleware(metrics.GetDefaultMetrics())
+
 	// Create admin handler
 	adminHandler := NewAdminHandler(aclConfig, quotaManager)
 
 	// Public endpoints (no authentication required)
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/", handleRoot)
+	mux.Handle("/metrics", promhttp.Handler()) // Prometheus metrics endpoint
 
 	// Admin endpoints (authentication + admin scope required)
 	adminMux := http.NewServeMux()
@@ -200,10 +207,13 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	authValidateMux.HandleFunc("/auth/validate", handleAuthValidate)
 	mux.Handle("/auth/validate", authMiddleware.Middleware(baseRateLimitMiddleware.Middleware(authValidateMux)))
 
+	// Wrap all routes with metrics middleware
+	metricsHandler := metricsMiddleware.Middleware(mux)
+
 	// Create HTTP server
 	httpServer := &http.Server{
 		Addr:         ":" + port,
-		Handler:      mux,
+		Handler:      metricsHandler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -214,7 +224,7 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	if tlsEnabled && tlsConfig != nil {
 		httpsServer = &http.Server{
 			Addr:         ":" + httpsPort,
-			Handler:      mux,
+			Handler:      metricsHandler,
 			TLSConfig:    tlsConfig,
 			ReadTimeout:  15 * time.Second,
 			WriteTimeout: 15 * time.Second,
