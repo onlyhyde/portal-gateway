@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/portal-project/portal-gateway/portal/config"
+	"github.com/portal-project/portal-gateway/portal/logging"
 	"github.com/portal-project/portal-gateway/portal/metrics"
 	"github.com/portal-project/portal-gateway/portal/middleware"
 	"github.com/portal-project/portal-gateway/portal/quota"
@@ -38,6 +40,33 @@ type Server struct {
 }
 
 func main() {
+	// Initialize structured logger
+	logFormat := logging.FormatJSON
+	if os.Getenv("LOG_FORMAT") == "text" {
+		logFormat = logging.FormatText
+	}
+
+	logLevel := slog.LevelInfo
+	if levelStr := os.Getenv("LOG_LEVEL"); levelStr != "" {
+		switch strings.ToUpper(levelStr) {
+		case "DEBUG":
+			logLevel = slog.LevelDebug
+		case "INFO":
+			logLevel = slog.LevelInfo
+		case "WARN":
+			logLevel = slog.LevelWarn
+		case "ERROR":
+			logLevel = slog.LevelError
+		}
+	}
+
+	logger := logging.NewLogger(&logging.Config{
+		Level:  logLevel,
+		Format: logFormat,
+		Output: os.Stdout,
+	})
+	logging.SetDefault(logger)
+
 	// Parse command line flags
 	port := flag.String("port", defaultPort, "Server HTTP port")
 	httpsPort := flag.String("https-port", defaultHTTPSPort, "Server HTTPS port")
@@ -48,12 +77,13 @@ func main() {
 	flag.Parse()
 
 	// Load authentication configuration
-	log.Printf("Loading authentication configuration from: %s", *configPath)
+	logging.Info("Loading authentication configuration", "path", *configPath)
 	authConfig, err := config.LoadFromFile(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to load auth configuration: %v", err)
+		logging.Error("Failed to load auth configuration", "error", err)
+		os.Exit(1)
 	}
-	log.Println("Authentication configuration loaded successfully")
+	logging.Info("Authentication configuration loaded successfully")
 
 	// Load TLS configuration if provided
 	var tlsConfig *tls.Config
@@ -151,6 +181,9 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	// Create metrics middleware
 	metricsMiddleware := metrics.NewMetricsMiddleware(metrics.GetDefaultMetrics())
 
+	// Create logging middleware
+	loggingMiddleware := logging.NewLoggingMiddleware(logging.Default())
+
 	// Create admin handler
 	adminHandler := NewAdminHandler(aclConfig, quotaManager)
 
@@ -207,13 +240,15 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	authValidateMux.HandleFunc("/auth/validate", handleAuthValidate)
 	mux.Handle("/auth/validate", authMiddleware.Middleware(baseRateLimitMiddleware.Middleware(authValidateMux)))
 
-	// Wrap all routes with metrics middleware
+	// Wrap all routes with middleware layers
+	// Order: logging -> metrics -> routes
 	metricsHandler := metricsMiddleware.Middleware(mux)
+	loggingHandler := loggingMiddleware.Middleware(metricsHandler)
 
 	// Create HTTP server
 	httpServer := &http.Server{
 		Addr:         ":" + port,
-		Handler:      metricsHandler,
+		Handler:      loggingHandler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -224,7 +259,7 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	if tlsEnabled && tlsConfig != nil {
 		httpsServer = &http.Server{
 			Addr:         ":" + httpsPort,
-			Handler:      metricsHandler,
+			Handler:      loggingHandler,
 			TLSConfig:    tlsConfig,
 			ReadTimeout:  15 * time.Second,
 			WriteTimeout: 15 * time.Second,
