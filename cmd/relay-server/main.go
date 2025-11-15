@@ -38,6 +38,7 @@ func main() {
 	httpsPort := flag.String("https-port", defaultHTTPSPort, "Server HTTPS port")
 	configPath := flag.String("config", defaultConfigPath, "Path to auth configuration file")
 	tlsConfigPath := flag.String("tls-config", "", "Path to TLS configuration file (optional)")
+	leaseRateLimitConfigPath := flag.String("lease-rate-limit-config", "", "Path to lease rate limit configuration file (optional)")
 	flag.Parse()
 
 	// Load authentication configuration
@@ -71,8 +72,22 @@ func main() {
 		}
 	}
 
+	// Load lease rate limit configuration if provided
+	var leaseRateLimitConfig *middleware.LeaseRateLimitConfig
+	if *leaseRateLimitConfigPath != "" {
+		log.Printf("Loading lease rate limit configuration from: %s", *leaseRateLimitConfigPath)
+		leaseRateLimitConfig, err = config.LoadLeaseRateLimitConfig(*leaseRateLimitConfigPath)
+		if err != nil {
+			log.Fatalf("Failed to load lease rate limit configuration: %v", err)
+		}
+		log.Printf("Lease rate limit configuration loaded successfully (%d rules)", len(leaseRateLimitConfig.ListRules()))
+	} else {
+		log.Println("No lease rate limit configuration provided, using defaults")
+		leaseRateLimitConfig = middleware.NewLeaseRateLimitConfig(50, 100)
+	}
+
 	// Create server
-	server := NewServer(*port, *httpsPort, authConfig, tlsConfig, tlsEnabled)
+	server := NewServer(*port, *httpsPort, authConfig, tlsConfig, tlsEnabled, leaseRateLimitConfig)
 
 	// Start server
 	if err := server.Start(); err != nil {
@@ -81,24 +96,27 @@ func main() {
 }
 
 // NewServer creates a new relay server instance
-func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsConfig *tls.Config, tlsEnabled bool) *Server {
+func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsConfig *tls.Config, tlsEnabled bool, leaseRateLimitConfig *middleware.LeaseRateLimitConfig) *Server {
 	mux := http.NewServeMux()
 
 	// Create ACL configuration
 	aclConfig := middleware.NewACLConfig()
 
-	// Create rate limit configuration
+	// Create base rate limit configuration (for admin and auth endpoints)
 	// 100 req/s global, 50 req/s per API key, 10 req/s per IP
-	rateLimitConfig := middleware.NewRateLimitConfig(100, 200)
-	rateLimitConfig.PerKeyRequestsPerSecond = 50
-	rateLimitConfig.PerKeyBurstSize = 100
-	rateLimitConfig.PerIPRequestsPerSecond = 10
-	rateLimitConfig.PerIPBurstSize = 20
+	baseRateLimitConfig := middleware.NewRateLimitConfig(100, 200)
+	baseRateLimitConfig.PerKeyRequestsPerSecond = 50
+	baseRateLimitConfig.PerKeyBurstSize = 100
+	baseRateLimitConfig.PerIPRequestsPerSecond = 10
+	baseRateLimitConfig.PerIPBurstSize = 20
 
 	// Create middlewares
 	authMiddleware := middleware.NewAuthMiddleware(authConfig)
 	aclMiddleware := middleware.NewACLMiddleware(aclConfig)
-	rateLimitMiddleware := middleware.NewRateLimitMiddleware(rateLimitConfig)
+	baseRateLimitMiddleware := middleware.NewRateLimitMiddleware(baseRateLimitConfig)
+
+	// Create lease-specific rate limit middleware (for peer endpoints)
+	leaseRateLimitMiddleware := middleware.NewLeaseRateLimitMiddleware(leaseRateLimitConfig, baseRateLimitConfig)
 
 	// Create admin handler
 	adminHandler := NewAdminHandler(aclConfig)
@@ -128,20 +146,21 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 		}
 	})
 
-	// Apply auth and rate limit middleware to admin routes
-	mux.Handle("/admin/", authMiddleware.Middleware(rateLimitMiddleware.Middleware(adminMux)))
+	// Apply auth and base rate limit middleware to admin routes
+	mux.Handle("/admin/", authMiddleware.Middleware(baseRateLimitMiddleware.Middleware(adminMux)))
 
-	// Protected endpoints (authentication + ACL + rate limiting required)
+	// Protected endpoints (authentication + ACL + lease-specific rate limiting required)
 	peerMux := http.NewServeMux()
 	peerMux.HandleFunc("/peer/", handlePeerRequest)
 
-	// Apply auth, rate limit, and ACL middleware to peer routes
-	mux.Handle("/peer/", authMiddleware.Middleware(rateLimitMiddleware.Middleware(aclMiddleware.Middleware(peerMux))))
+	// Apply auth, ACL, and lease-specific rate limit middleware to peer routes
+	// Order: auth -> ACL (sets lease ID in context) -> lease rate limit
+	mux.Handle("/peer/", authMiddleware.Middleware(aclMiddleware.Middleware(leaseRateLimitMiddleware.Middleware(peerMux))))
 
-	// Auth validation endpoint (authentication + rate limiting only, no ACL)
+	// Auth validation endpoint (authentication + base rate limiting only, no ACL)
 	authValidateMux := http.NewServeMux()
 	authValidateMux.HandleFunc("/auth/validate", handleAuthValidate)
-	mux.Handle("/auth/validate", authMiddleware.Middleware(rateLimitMiddleware.Middleware(authValidateMux)))
+	mux.Handle("/auth/validate", authMiddleware.Middleware(baseRateLimitMiddleware.Middleware(authValidateMux)))
 
 	// Create HTTP server
 	httpServer := &http.Server{

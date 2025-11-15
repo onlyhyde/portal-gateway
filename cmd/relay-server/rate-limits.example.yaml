@@ -1,0 +1,40 @@
+# Lease-Specific Rate Limits Configuration
+# Copy this file to rate-limits.yaml and customize for your needs
+
+# Default rate limit for unconfigured leases
+default_rate: 50.0  # requests per second
+default_burst: 100  # burst capacity
+
+# Lease-specific rate limits
+leases:
+  # MCP servers (moderate rate)
+  - lease_id: "mcp-*"
+    requests_per_second: 50.0
+    burst_size: 100
+
+  # n8n webhooks (high rate for automation)
+  - lease_id: "n8n-*"
+    requests_per_second: 200.0
+    burst_size: 400
+
+  # OpenAI function endpoints (moderate-high rate)
+  - lease_id: "openai-*"
+    requests_per_second: 100.0
+    burst_size: 200
+
+  # Specific high-priority lease
+  - lease_id: "priority-service-1"
+    requests_per_second: 500.0
+    burst_size: 1000
+
+  # Development/testing leases (lower rate)
+  - lease_id: "dev-*"
+    requests_per_second: 10.0
+    burst_size: 20
+
+# Notes:
+# - Wildcards (*) are supported for lease_id patterns
+# - Wildcard must be at the end (e.g., "mcp-*")
+# - Exact matches take precedence over wildcard matches
+# - burst_size is optional (defaults to 2x requests_per_second)
+# - Configuration can be updated via admin API without restart
