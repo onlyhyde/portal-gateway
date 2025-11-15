@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,20 +19,25 @@ import (
 
 const (
 	defaultPort       = "8080"
+	defaultHTTPSPort  = "8443"
 	defaultConfigPath = "auth-config.yaml"
 )
 
 // Server represents the relay server
 type Server struct {
-	httpServer *http.Server
-	authConfig *middleware.AuthConfig
-	aclConfig  *middleware.ACLConfig
+	httpServer  *http.Server
+	httpsServer *http.Server
+	authConfig  *middleware.AuthConfig
+	aclConfig   *middleware.ACLConfig
+	tlsEnabled  bool
 }
 
 func main() {
 	// Parse command line flags
-	port := flag.String("port", defaultPort, "Server port")
+	port := flag.String("port", defaultPort, "Server HTTP port")
+	httpsPort := flag.String("https-port", defaultHTTPSPort, "Server HTTPS port")
 	configPath := flag.String("config", defaultConfigPath, "Path to auth configuration file")
+	tlsConfigPath := flag.String("tls-config", "", "Path to TLS configuration file (optional)")
 	flag.Parse()
 
 	// Load authentication configuration
@@ -42,8 +48,31 @@ func main() {
 	}
 	log.Println("Authentication configuration loaded successfully")
 
+	// Load TLS configuration if provided
+	var tlsConfig *tls.Config
+	var tlsEnabled bool
+	if *tlsConfigPath != "" {
+		log.Printf("Loading TLS configuration from: %s", *tlsConfigPath)
+		portalTLSConfig, err := config.LoadTLSConfig(*tlsConfigPath)
+		if err != nil {
+			log.Fatalf("Failed to load TLS configuration: %v", err)
+		}
+		tlsConfig = portalTLSConfig.GetTLSConfig()
+		tlsEnabled = true
+		log.Println("TLS configuration loaded successfully")
+
+		// Display certificate info
+		if certInfo, err := portalTLSConfig.GetCertificateInfo(); err == nil {
+			log.Printf("Certificate Info:")
+			log.Printf("  Subject: %s", certInfo.Subject)
+			log.Printf("  Issuer: %s", certInfo.Issuer)
+			log.Printf("  Valid: %s - %s", certInfo.NotBefore.Format("2006-01-02"), certInfo.NotAfter.Format("2006-01-02"))
+			log.Printf("  Expires in: %v", certInfo.ExpiresIn())
+		}
+	}
+
 	// Create server
-	server := NewServer(*port, authConfig)
+	server := NewServer(*port, *httpsPort, authConfig, tlsConfig, tlsEnabled)
 
 	// Start server
 	if err := server.Start(); err != nil {
@@ -52,7 +81,7 @@ func main() {
 }
 
 // NewServer creates a new relay server instance
-func NewServer(port string, authConfig *middleware.AuthConfig) *Server {
+func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsConfig *tls.Config, tlsEnabled bool) *Server {
 	mux := http.NewServeMux()
 
 	// Create ACL configuration
@@ -114,10 +143,25 @@ func NewServer(port string, authConfig *middleware.AuthConfig) *Server {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	// Create HTTPS server if TLS is enabled
+	var httpsServer *http.Server
+	if tlsEnabled && tlsConfig != nil {
+		httpsServer = &http.Server{
+			Addr:         ":" + httpsPort,
+			Handler:      mux,
+			TLSConfig:    tlsConfig,
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 15 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
+	}
+
 	return &Server{
-		httpServer: httpServer,
-		authConfig: authConfig,
-		aclConfig:  aclConfig,
+		httpServer:  httpServer,
+		httpsServer: httpsServer,
+		authConfig:  authConfig,
+		aclConfig:   aclConfig,
+		tlsEnabled:  tlsEnabled,
 	}
 }
 
@@ -127,12 +171,23 @@ func (s *Server) Start() error {
 	shutdown := make(chan error, 1)
 	go s.handleShutdown(shutdown)
 
-	log.Printf("Starting relay server on %s", s.httpServer.Addr)
+	// Start HTTPS server if TLS is enabled
+	if s.tlsEnabled && s.httpsServer != nil {
+		go func() {
+			log.Printf("Starting HTTPS server on %s", s.httpsServer.Addr)
+			if err := s.httpsServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				shutdown <- fmt.Errorf("HTTPS server error: %w", err)
+			}
+		}()
+	}
 
 	// Start HTTP server
-	if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("HTTP server error: %w", err)
-	}
+	log.Printf("Starting HTTP server on %s", s.httpServer.Addr)
+	go func() {
+		if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			shutdown <- fmt.Errorf("HTTP server error: %w", err)
+		}
+	}()
 
 	// Wait for shutdown signal
 	return <-shutdown
@@ -150,7 +205,17 @@ func (s *Server) handleShutdown(shutdown chan<- error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Shutdown HTTPS server if running
+	if s.tlsEnabled && s.httpsServer != nil {
+		log.Println("Shutting down HTTPS server...")
+		if err := s.httpsServer.Shutdown(ctx); err != nil {
+			shutdown <- fmt.Errorf("HTTPS server shutdown error: %w", err)
+			return
+		}
+	}
+
 	// Shutdown HTTP server
+	log.Println("Shutting down HTTP server...")
 	if err := s.httpServer.Shutdown(ctx); err != nil {
 		shutdown <- fmt.Errorf("HTTP server shutdown error: %w", err)
 		return

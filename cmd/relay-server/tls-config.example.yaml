@@ -1,0 +1,26 @@
+# TLS Configuration Example
+# Copy this file to tls-config.yaml and update with your settings
+# NEVER commit tls-config.yaml to version control!
+
+# Manual certificate configuration
+cert_file: "/path/to/cert.pem"
+key_file: "/path/to/key.pem"
+
+# Let's Encrypt / ACME configuration (alternative to manual certs)
+enable_acme: false
+acme_domains:
+  - "portal-gateway.example.com"
+  - "www.portal-gateway.example.com"
+acme_email: "admin@example.com"
+acme_cache_dir: "./autocert-cache"
+
+# Mutual TLS (mTLS) configuration (optional)
+enable_mtls: false
+ca_file: "/path/to/ca.pem"
+verify_client_cert: true
+
+# Notes:
+# - Use either manual certificates OR ACME, not both
+# - For ACME, server must be reachable on port 80 for HTTP-01 challenge
+# - For mTLS, clients must present valid certificates signed by CA
+# - cert_file and key_file are ignored if enable_acme is true
