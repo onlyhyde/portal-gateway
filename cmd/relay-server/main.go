@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/portal-project/portal-gateway/portal/config"
 	"github.com/portal-project/portal-gateway/portal/middleware"
+	"github.com/portal-project/portal-gateway/portal/quota"
 )
 
 const (
@@ -39,6 +41,7 @@ func main() {
 	configPath := flag.String("config", defaultConfigPath, "Path to auth configuration file")
 	tlsConfigPath := flag.String("tls-config", "", "Path to TLS configuration file (optional)")
 	leaseRateLimitConfigPath := flag.String("lease-rate-limit-config", "", "Path to lease rate limit configuration file (optional)")
+	quotaConfigPath := flag.String("quota-config", "", "Path to quota configuration file (optional)")
 	flag.Parse()
 
 	// Load authentication configuration
@@ -86,8 +89,29 @@ func main() {
 		leaseRateLimitConfig = middleware.NewLeaseRateLimitConfig(50, 100)
 	}
 
+	// Load quota configuration if provided
+	var quotaManager *quota.Manager
+	if *quotaConfigPath != "" {
+		log.Printf("Loading quota configuration from: %s", *quotaConfigPath)
+		quotaManager, err = config.LoadQuotaConfig(*quotaConfigPath)
+		if err != nil {
+			log.Fatalf("Failed to load quota configuration: %v", err)
+		}
+		log.Printf("Quota configuration loaded successfully (%d limits)", len(quotaManager.ListLimits()))
+		defer quotaManager.Close()
+	} else {
+		log.Println("No quota configuration provided, using default in-memory storage")
+		// Create default quota manager with SQLite storage
+		storage, err := quota.NewSQLiteStorage("quota.db")
+		if err != nil {
+			log.Fatalf("Failed to create quota storage: %v", err)
+		}
+		quotaManager = quota.NewManager(storage, 1000000, 107374182400, 100)
+		defer quotaManager.Close()
+	}
+
 	// Create server
-	server := NewServer(*port, *httpsPort, authConfig, tlsConfig, tlsEnabled, leaseRateLimitConfig)
+	server := NewServer(*port, *httpsPort, authConfig, tlsConfig, tlsEnabled, leaseRateLimitConfig, quotaManager)
 
 	// Start server
 	if err := server.Start(); err != nil {
@@ -96,7 +120,7 @@ func main() {
 }
 
 // NewServer creates a new relay server instance
-func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsConfig *tls.Config, tlsEnabled bool, leaseRateLimitConfig *middleware.LeaseRateLimitConfig) *Server {
+func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsConfig *tls.Config, tlsEnabled bool, leaseRateLimitConfig *middleware.LeaseRateLimitConfig, quotaManager *quota.Manager) *Server {
 	mux := http.NewServeMux()
 
 	// Create ACL configuration
@@ -118,8 +142,11 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	// Create lease-specific rate limit middleware (for peer endpoints)
 	leaseRateLimitMiddleware := middleware.NewLeaseRateLimitMiddleware(leaseRateLimitConfig, baseRateLimitConfig)
 
+	// Create quota middleware
+	quotaMiddleware := quota.NewQuotaMiddleware(quotaManager)
+
 	// Create admin handler
-	adminHandler := NewAdminHandler(aclConfig)
+	adminHandler := NewAdminHandler(aclConfig, quotaManager)
 
 	// Public endpoints (no authentication required)
 	mux.HandleFunc("/health", handleHealth)
@@ -145,17 +172,28 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+	adminMux.HandleFunc("/admin/quota/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/reset") && r.Method == http.MethodPost {
+			adminHandler.HandleResetQuota(w, r)
+		} else if r.Method == http.MethodGet {
+			adminHandler.HandleGetQuotaStatus(w, r)
+		} else if r.Method == http.MethodPost {
+			adminHandler.HandleSetQuotaLimit(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
 
 	// Apply auth and base rate limit middleware to admin routes
 	mux.Handle("/admin/", authMiddleware.Middleware(baseRateLimitMiddleware.Middleware(adminMux)))
 
-	// Protected endpoints (authentication + ACL + lease-specific rate limiting required)
+	// Protected endpoints (authentication + ACL + quota + lease-specific rate limiting required)
 	peerMux := http.NewServeMux()
 	peerMux.HandleFunc("/peer/", handlePeerRequest)
 
-	// Apply auth, ACL, and lease-specific rate limit middleware to peer routes
-	// Order: auth -> ACL (sets lease ID in context) -> lease rate limit
-	mux.Handle("/peer/", authMiddleware.Middleware(aclMiddleware.Middleware(leaseRateLimitMiddleware.Middleware(peerMux))))
+	// Apply auth, ACL, quota, and lease-specific rate limit middleware to peer routes
+	// Order: auth -> ACL (sets lease ID) -> quota -> lease rate limit -> handler
+	mux.Handle("/peer/", authMiddleware.Middleware(aclMiddleware.Middleware(quotaMiddleware.Middleware(leaseRateLimitMiddleware.Middleware(peerMux)))))
 
 	// Auth validation endpoint (authentication + base rate limiting only, no ACL)
 	authValidateMux := http.NewServeMux()
