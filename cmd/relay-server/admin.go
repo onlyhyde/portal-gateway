@@ -6,23 +6,27 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/portal-project/portal-gateway/portal/middleware"
 	"github.com/portal-project/portal-gateway/portal/quota"
+	"github.com/portal-project/portal-gateway/portal/webhook"
 )
 
 // AdminHandler handles administrative operations
 type AdminHandler struct {
 	aclConfig    *middleware.ACLConfig
 	quotaManager *quota.Manager
+	dlq          *webhook.DLQ
 }
 
 // NewAdminHandler creates a new admin handler
-func NewAdminHandler(aclConfig *middleware.ACLConfig, quotaManager *quota.Manager) *AdminHandler {
+func NewAdminHandler(aclConfig *middleware.ACLConfig, quotaManager *quota.Manager, dlq *webhook.DLQ) *AdminHandler {
 	return &AdminHandler{
 		aclConfig:    aclConfig,
 		quotaManager: quotaManager,
+		dlq:          dlq,
 	}
 }
 
@@ -390,4 +394,217 @@ func (h *AdminHandler) HandleResetQuota(w http.ResponseWriter, r *http.Request) 
 	}
 
 	h.sendSuccess(w, http.StatusOK, fmt.Sprintf("Quota for key %s reset successfully", keyID))
+}
+
+// DLQListResponse represents a list of DLQ entries
+type DLQListResponse struct {
+	Entries []*webhook.DLQEntry `json:"entries"`
+	Total   int                 `json:"total"`
+	Limit   int                 `json:"limit"`
+	Offset  int                 `json:"offset"`
+}
+
+// HandleListDLQ handles GET /admin/dlq
+func (h *AdminHandler) HandleListDLQ(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		h.sendError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET is allowed")
+		return
+	}
+
+	// Check if requester has admin scope
+	apiKeyInfo := middleware.GetAPIKeyInfo(r.Context())
+	if apiKeyInfo == nil || !apiKeyInfo.HasScope("admin") {
+		h.sendError(w, http.StatusForbidden, "insufficient_permissions", "Admin scope required")
+		return
+	}
+
+	// Parse query parameters
+	limit := 100
+	offset := 0
+
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+
+	if offsetStr := r.URL.Query().Get("offset"); offsetStr != "" {
+		if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
+			offset = o
+		}
+	}
+
+	// Get DLQ entries
+	entries, err := h.dlq.List(limit, offset)
+	if err != nil {
+		h.sendError(w, http.StatusInternalServerError, "list_failed", err.Error())
+		return
+	}
+
+	// Get total count
+	total, err := h.dlq.Count()
+	if err != nil {
+		h.sendError(w, http.StatusInternalServerError, "count_failed", err.Error())
+		return
+	}
+
+	response := DLQListResponse{
+		Entries: entries,
+		Total:   total,
+		Limit:   limit,
+		Offset:  offset,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// HandleRetryDLQ handles POST /admin/dlq/{id}/retry
+func (h *AdminHandler) HandleRetryDLQ(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		h.sendError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed")
+		return
+	}
+
+	// Check if requester has admin scope
+	apiKeyInfo := middleware.GetAPIKeyInfo(r.Context())
+	if apiKeyInfo == nil || !apiKeyInfo.HasScope("admin") {
+		h.sendError(w, http.StatusForbidden, "insufficient_permissions", "Admin scope required")
+		return
+	}
+
+	// Extract ID from URL (remove "/retry" suffix)
+	path := strings.TrimSuffix(r.URL.Path, "/retry")
+	idStr := extractLeaseIDFromPath(path, "/admin/dlq/")
+	if idStr == "" {
+		h.sendError(w, http.StatusBadRequest, "invalid_id", "Entry ID is required")
+		return
+	}
+
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		h.sendError(w, http.StatusBadRequest, "invalid_id", "Entry ID must be a number")
+		return
+	}
+
+	// Get entry from DLQ
+	entry, err := h.dlq.Get(id)
+	if err != nil {
+		h.sendError(w, http.StatusNotFound, "entry_not_found", err.Error())
+		return
+	}
+
+	// Create retry handler
+	retryHandler := webhook.NewRetryHandler(nil)
+
+	// Reconstruct request
+	req, err := http.NewRequest(entry.Method, entry.URL, strings.NewReader(string(entry.Body)))
+	if err != nil {
+		h.sendError(w, http.StatusInternalServerError, "request_failed", err.Error())
+		return
+	}
+
+	// Set headers
+	for key, values := range entry.Headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+
+	// Retry the request
+	resp, err := retryHandler.Do(req)
+	if err != nil {
+		h.sendError(w, http.StatusBadGateway, "retry_failed", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	// If retry successful, delete from DLQ
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := h.dlq.Delete(id); err != nil {
+			// Log error but don't fail the request
+			fmt.Printf("Failed to delete DLQ entry after successful retry: %v\n", err)
+		}
+
+		h.sendSuccess(w, http.StatusOK, fmt.Sprintf("DLQ entry %d retried successfully", id))
+		return
+	}
+
+	h.sendError(w, http.StatusBadGateway, "retry_failed", fmt.Sprintf("Retry failed with status %d", resp.StatusCode))
+}
+
+// HandleDeleteDLQ handles DELETE /admin/dlq/{id}
+func (h *AdminHandler) HandleDeleteDLQ(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		h.sendError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only DELETE is allowed")
+		return
+	}
+
+	// Check if requester has admin scope
+	apiKeyInfo := middleware.GetAPIKeyInfo(r.Context())
+	if apiKeyInfo == nil || !apiKeyInfo.HasScope("admin") {
+		h.sendError(w, http.StatusForbidden, "insufficient_permissions", "Admin scope required")
+		return
+	}
+
+	// Extract ID from URL
+	idStr := extractLeaseIDFromPath(r.URL.Path, "/admin/dlq/")
+	if idStr == "" {
+		h.sendError(w, http.StatusBadRequest, "invalid_id", "Entry ID is required")
+		return
+	}
+
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		h.sendError(w, http.StatusBadRequest, "invalid_id", "Entry ID must be a number")
+		return
+	}
+
+	// Delete entry
+	if err := h.dlq.Delete(id); err != nil {
+		h.sendError(w, http.StatusNotFound, "entry_not_found", err.Error())
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, fmt.Sprintf("DLQ entry %d deleted successfully", id))
+}
+
+// HandleGetDLQ handles GET /admin/dlq/{id}
+func (h *AdminHandler) HandleGetDLQ(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		h.sendError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET is allowed")
+		return
+	}
+
+	// Check if requester has admin scope
+	apiKeyInfo := middleware.GetAPIKeyInfo(r.Context())
+	if apiKeyInfo == nil || !apiKeyInfo.HasScope("admin") {
+		h.sendError(w, http.StatusForbidden, "insufficient_permissions", "Admin scope required")
+		return
+	}
+
+	// Extract ID from URL
+	idStr := extractLeaseIDFromPath(r.URL.Path, "/admin/dlq/")
+	if idStr == "" {
+		h.sendError(w, http.StatusBadRequest, "invalid_id", "Entry ID is required")
+		return
+	}
+
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		h.sendError(w, http.StatusBadRequest, "invalid_id", "Entry ID must be a number")
+		return
+	}
+
+	// Get entry
+	entry, err := h.dlq.Get(id)
+	if err != nil {
+		h.sendError(w, http.StatusNotFound, "entry_not_found", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(entry)
 }
