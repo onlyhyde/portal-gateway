@@ -23,6 +23,7 @@ import (
 	"github.com/portal-project/portal-gateway/portal/metrics"
 	"github.com/portal-project/portal-gateway/portal/middleware"
 	"github.com/portal-project/portal-gateway/portal/quota"
+	"github.com/portal-project/portal-gateway/portal/timeout"
 )
 
 const (
@@ -194,6 +195,11 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	}
 	circuitBreakerMiddleware := circuitbreaker.NewMiddleware(circuitBreakerConfig)
 
+	// Create timeout middleware
+	// Default 30s, MCP 10s, n8n 60s, OpenAI 30s
+	timeoutConfig := timeout.DefaultMiddlewareConfig()
+	timeoutMiddleware := timeout.NewMiddleware(timeoutConfig)
+
 	// Create admin handler
 	adminHandler := NewAdminHandler(aclConfig, quotaManager)
 
@@ -237,13 +243,13 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	// Apply auth and base rate limit middleware to admin routes
 	mux.Handle("/admin/", authMiddleware.Middleware(baseRateLimitMiddleware.Middleware(adminMux)))
 
-	// Protected endpoints (authentication + ACL + circuit breaker + quota + lease-specific rate limiting required)
+	// Protected endpoints (authentication + ACL + timeout + circuit breaker + quota + lease-specific rate limiting required)
 	peerMux := http.NewServeMux()
 	peerMux.HandleFunc("/peer/", handlePeerRequest)
 
-	// Apply auth, ACL, circuit breaker, quota, and lease-specific rate limit middleware to peer routes
-	// Order: auth -> ACL (sets lease ID) -> circuit breaker -> quota -> lease rate limit -> handler
-	mux.Handle("/peer/", authMiddleware.Middleware(aclMiddleware.Middleware(circuitBreakerMiddleware.Middleware(quotaMiddleware.Middleware(leaseRateLimitMiddleware.Middleware(peerMux))))))
+	// Apply auth, ACL, timeout, circuit breaker, quota, and lease-specific rate limit middleware to peer routes
+	// Order: auth -> ACL (sets lease ID) -> timeout -> circuit breaker -> quota -> lease rate limit -> handler
+	mux.Handle("/peer/", authMiddleware.Middleware(aclMiddleware.Middleware(timeoutMiddleware.Middleware(circuitBreakerMiddleware.Middleware(quotaMiddleware.Middleware(leaseRateLimitMiddleware.Middleware(peerMux)))))))
 
 	// Auth validation endpoint (authentication + base rate limiting only, no ACL)
 	authValidateMux := http.NewServeMux()
