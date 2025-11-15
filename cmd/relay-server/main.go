@@ -17,6 +17,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/portal-project/portal-gateway/portal/circuitbreaker"
 	"github.com/portal-project/portal-gateway/portal/config"
 	"github.com/portal-project/portal-gateway/portal/logging"
 	"github.com/portal-project/portal-gateway/portal/metrics"
@@ -184,6 +185,15 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	// Create logging middleware
 	loggingMiddleware := logging.NewLoggingMiddleware(logging.Default())
 
+	// Create circuit breaker middleware
+	// 3 max requests in half-open, 30s timeout, 5 consecutive failures to trip
+	circuitBreakerConfig := &circuitbreaker.MiddlewareConfig{
+		MaxRequests:      3,
+		Timeout:          30 * time.Second,
+		FailureThreshold: 5,
+	}
+	circuitBreakerMiddleware := circuitbreaker.NewMiddleware(circuitBreakerConfig)
+
 	// Create admin handler
 	adminHandler := NewAdminHandler(aclConfig, quotaManager)
 
@@ -227,13 +237,13 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	// Apply auth and base rate limit middleware to admin routes
 	mux.Handle("/admin/", authMiddleware.Middleware(baseRateLimitMiddleware.Middleware(adminMux)))
 
-	// Protected endpoints (authentication + ACL + quota + lease-specific rate limiting required)
+	// Protected endpoints (authentication + ACL + circuit breaker + quota + lease-specific rate limiting required)
 	peerMux := http.NewServeMux()
 	peerMux.HandleFunc("/peer/", handlePeerRequest)
 
-	// Apply auth, ACL, quota, and lease-specific rate limit middleware to peer routes
-	// Order: auth -> ACL (sets lease ID) -> quota -> lease rate limit -> handler
-	mux.Handle("/peer/", authMiddleware.Middleware(aclMiddleware.Middleware(quotaMiddleware.Middleware(leaseRateLimitMiddleware.Middleware(peerMux)))))
+	// Apply auth, ACL, circuit breaker, quota, and lease-specific rate limit middleware to peer routes
+	// Order: auth -> ACL (sets lease ID) -> circuit breaker -> quota -> lease rate limit -> handler
+	mux.Handle("/peer/", authMiddleware.Middleware(aclMiddleware.Middleware(circuitBreakerMiddleware.Middleware(quotaMiddleware.Middleware(leaseRateLimitMiddleware.Middleware(peerMux))))))
 
 	// Auth validation endpoint (authentication + base rate limiting only, no ACL)
 	authValidateMux := http.NewServeMux()
