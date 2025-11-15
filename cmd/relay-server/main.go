@@ -26,6 +26,7 @@ import (
 	"github.com/portal-project/portal-gateway/portal/shutdown"
 	"github.com/portal-project/portal-gateway/portal/streaming"
 	"github.com/portal-project/portal-gateway/portal/timeout"
+	"github.com/portal-project/portal-gateway/portal/webhook"
 )
 
 const (
@@ -211,8 +212,15 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	// Create shutdown manager
 	shutdownManager := shutdown.NewManager(nil)
 
+	// Create DLQ
+	dlq, err := webhook.NewDLQ("dlq.db")
+	if err != nil {
+		log.Fatalf("Failed to create DLQ: %v", err)
+	}
+	defer dlq.Close()
+
 	// Create admin handler
-	adminHandler := NewAdminHandler(aclConfig, quotaManager)
+	adminHandler := NewAdminHandler(aclConfig, quotaManager, dlq)
 
 	// Public endpoints (no authentication required)
 	mux.HandleFunc("/health", makeHealthHandler(shutdownManager))
@@ -246,6 +254,24 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 			adminHandler.HandleGetQuotaStatus(w, r)
 		} else if r.Method == http.MethodPost {
 			adminHandler.HandleSetQuotaLimit(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	adminMux.HandleFunc("/admin/dlq", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			adminHandler.HandleListDLQ(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	adminMux.HandleFunc("/admin/dlq/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/retry") && r.Method == http.MethodPost {
+			adminHandler.HandleRetryDLQ(w, r)
+		} else if r.Method == http.MethodGet {
+			adminHandler.HandleGetDLQ(w, r)
+		} else if r.Method == http.MethodDelete {
+			adminHandler.HandleDeleteDLQ(w, r)
 		} else {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
