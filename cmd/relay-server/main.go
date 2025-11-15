@@ -23,6 +23,7 @@ import (
 	"github.com/portal-project/portal-gateway/portal/metrics"
 	"github.com/portal-project/portal-gateway/portal/middleware"
 	"github.com/portal-project/portal-gateway/portal/quota"
+	"github.com/portal-project/portal-gateway/portal/shutdown"
 	"github.com/portal-project/portal-gateway/portal/timeout"
 )
 
@@ -34,11 +35,12 @@ const (
 
 // Server represents the relay server
 type Server struct {
-	httpServer  *http.Server
-	httpsServer *http.Server
-	authConfig  *middleware.AuthConfig
-	aclConfig   *middleware.ACLConfig
-	tlsEnabled  bool
+	httpServer      *http.Server
+	httpsServer     *http.Server
+	authConfig      *middleware.AuthConfig
+	aclConfig       *middleware.ACLConfig
+	tlsEnabled      bool
+	shutdownManager *shutdown.Manager
 }
 
 func main() {
@@ -200,11 +202,14 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	timeoutConfig := timeout.DefaultMiddlewareConfig()
 	timeoutMiddleware := timeout.NewMiddleware(timeoutConfig)
 
+	// Create shutdown manager
+	shutdownManager := shutdown.NewManager(nil)
+
 	// Create admin handler
 	adminHandler := NewAdminHandler(aclConfig, quotaManager)
 
 	// Public endpoints (no authentication required)
-	mux.HandleFunc("/health", handleHealth)
+	mux.HandleFunc("/health", makeHealthHandler(shutdownManager))
 	mux.HandleFunc("/", handleRoot)
 	mux.Handle("/metrics", promhttp.Handler()) // Prometheus metrics endpoint
 
@@ -283,12 +288,25 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 		}
 	}
 
+	// Register servers with shutdown manager
+	shutdownManager.RegisterServer(httpServer)
+	if httpsServer != nil {
+		shutdownManager.RegisterServer(httpsServer)
+	}
+
+	// Register cleanup functions
+	shutdownManager.RegisterCleanup(func() error {
+		quotaManager.Close()
+		return nil
+	})
+
 	return &Server{
-		httpServer:  httpServer,
-		httpsServer: httpsServer,
-		authConfig:  authConfig,
-		aclConfig:   aclConfig,
-		tlsEnabled:  tlsEnabled,
+		httpServer:      httpServer,
+		httpsServer:     httpsServer,
+		authConfig:      authConfig,
+		aclConfig:       aclConfig,
+		tlsEnabled:      tlsEnabled,
+		shutdownManager: shutdownManager,
 	}
 }
 
@@ -332,19 +350,10 @@ func (s *Server) handleShutdown(shutdown chan<- error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Shutdown HTTPS server if running
-	if s.tlsEnabled && s.httpsServer != nil {
-		log.Println("Shutting down HTTPS server...")
-		if err := s.httpsServer.Shutdown(ctx); err != nil {
-			shutdown <- fmt.Errorf("HTTPS server shutdown error: %w", err)
-			return
-		}
-	}
-
-	// Shutdown HTTP server
-	log.Println("Shutting down HTTP server...")
-	if err := s.httpServer.Shutdown(ctx); err != nil {
-		shutdown <- fmt.Errorf("HTTP server shutdown error: %w", err)
+	// Use shutdown manager for graceful shutdown
+	log.Println("Shutting down servers...")
+	if err := s.shutdownManager.Shutdown(ctx); err != nil {
+		shutdown <- fmt.Errorf("shutdown error: %w", err)
 		return
 	}
 
@@ -352,11 +361,21 @@ func (s *Server) handleShutdown(shutdown chan<- error) {
 	shutdown <- nil
 }
 
-// handleHealth handles health check requests
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"status":"healthy","timestamp":"%s"}`, time.Now().Format(time.RFC3339))
+// makeHealthHandler creates a health check handler that returns 503 during shutdown
+func makeHealthHandler(sm *shutdown.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Return 503 if shutting down
+		if sm.IsShuttingDown() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(w, `{"status":"shutting_down","timestamp":"%s"}`, time.Now().Format(time.RFC3339))
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"healthy","timestamp":"%s"}`, time.Now().Format(time.RFC3339))
+	}
 }
 
 // handleRoot handles root path requests
