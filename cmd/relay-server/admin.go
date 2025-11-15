@@ -9,17 +9,20 @@ import (
 	"strings"
 
 	"github.com/portal-project/portal-gateway/portal/middleware"
+	"github.com/portal-project/portal-gateway/portal/quota"
 )
 
 // AdminHandler handles administrative operations
 type AdminHandler struct {
-	aclConfig *middleware.ACLConfig
+	aclConfig    *middleware.ACLConfig
+	quotaManager *quota.Manager
 }
 
 // NewAdminHandler creates a new admin handler
-func NewAdminHandler(aclConfig *middleware.ACLConfig) *AdminHandler {
+func NewAdminHandler(aclConfig *middleware.ACLConfig, quotaManager *quota.Manager) *AdminHandler {
 	return &AdminHandler{
-		aclConfig: aclConfig,
+		aclConfig:    aclConfig,
+		quotaManager: quotaManager,
 	}
 }
 
@@ -271,4 +274,120 @@ func (h *AdminHandler) sendSuccess(w http.ResponseWriter, statusCode int, messag
 	}
 
 	json.NewEncoder(w).Encode(response)
+}
+
+// QuotaLimitRequest represents a request to set quota limits
+type QuotaLimitRequest struct {
+	KeyID                 string `json:"key_id"`
+	MonthlyRequestLimit   int64  `json:"monthly_request_limit"`
+	MonthlyBytesLimit     int64  `json:"monthly_bytes_limit"`
+	ConcurrentConnections int    `json:"concurrent_connections"`
+}
+
+// HandleGetQuotaStatus handles GET /admin/quota/{keyID}
+func (h *AdminHandler) HandleGetQuotaStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		h.sendError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET is allowed")
+		return
+	}
+
+	// Check if requester has admin scope
+	apiKeyInfo := middleware.GetAPIKeyInfo(r.Context())
+	if apiKeyInfo == nil || !apiKeyInfo.HasScope("admin") {
+		h.sendError(w, http.StatusForbidden, "insufficient_permissions", "Admin scope required")
+		return
+	}
+
+	// Extract key ID from URL
+	keyID := extractLeaseIDFromPath(r.URL.Path, "/admin/quota/")
+	if keyID == "" {
+		h.sendError(w, http.StatusBadRequest, "invalid_key_id", "Key ID is required")
+		return
+	}
+
+	// Get quota status
+	status, err := h.quotaManager.GetStatus(keyID)
+	if err != nil {
+		h.sendError(w, http.StatusInternalServerError, "get_status_failed", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(status)
+}
+
+// HandleSetQuotaLimit handles POST /admin/quota/{keyID}
+func (h *AdminHandler) HandleSetQuotaLimit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		h.sendError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed")
+		return
+	}
+
+	// Check if requester has admin scope
+	apiKeyInfo := middleware.GetAPIKeyInfo(r.Context())
+	if apiKeyInfo == nil || !apiKeyInfo.HasScope("admin") {
+		h.sendError(w, http.StatusForbidden, "insufficient_permissions", "Admin scope required")
+		return
+	}
+
+	// Parse request body
+	var req QuotaLimitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.sendError(w, http.StatusBadRequest, "invalid_request", "Invalid JSON body")
+		return
+	}
+
+	// Validate key ID
+	if req.KeyID == "" {
+		h.sendError(w, http.StatusBadRequest, "invalid_key_id", "Key ID is required")
+		return
+	}
+
+	// Create quota limit
+	limit := &quota.QuotaLimit{
+		KeyID:                 req.KeyID,
+		MonthlyRequestLimit:   req.MonthlyRequestLimit,
+		MonthlyBytesLimit:     req.MonthlyBytesLimit,
+		ConcurrentConnections: req.ConcurrentConnections,
+	}
+
+	// Set limit
+	if err := h.quotaManager.SetLimit(limit); err != nil {
+		h.sendError(w, http.StatusBadRequest, "set_limit_failed", err.Error())
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, fmt.Sprintf("Quota limit for key %s updated successfully", req.KeyID))
+}
+
+// HandleResetQuota handles POST /admin/quota/{keyID}/reset
+func (h *AdminHandler) HandleResetQuota(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		h.sendError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed")
+		return
+	}
+
+	// Check if requester has admin scope
+	apiKeyInfo := middleware.GetAPIKeyInfo(r.Context())
+	if apiKeyInfo == nil || !apiKeyInfo.HasScope("admin") {
+		h.sendError(w, http.StatusForbidden, "insufficient_permissions", "Admin scope required")
+		return
+	}
+
+	// Extract key ID from URL (remove "/reset" suffix)
+	path := strings.TrimSuffix(r.URL.Path, "/reset")
+	keyID := extractLeaseIDFromPath(path, "/admin/quota/")
+	if keyID == "" {
+		h.sendError(w, http.StatusBadRequest, "invalid_key_id", "Key ID is required")
+		return
+	}
+
+	// Reset quota
+	if err := h.quotaManager.ResetQuota(keyID); err != nil {
+		h.sendError(w, http.StatusInternalServerError, "reset_failed", err.Error())
+		return
+	}
+
+	h.sendSuccess(w, http.StatusOK, fmt.Sprintf("Quota for key %s reset successfully", keyID))
 }
