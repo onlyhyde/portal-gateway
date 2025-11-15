@@ -87,9 +87,18 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 	// Create ACL configuration
 	aclConfig := middleware.NewACLConfig()
 
+	// Create rate limit configuration
+	// 100 req/s global, 50 req/s per API key, 10 req/s per IP
+	rateLimitConfig := middleware.NewRateLimitConfig(100, 200)
+	rateLimitConfig.PerKeyRequestsPerSecond = 50
+	rateLimitConfig.PerKeyBurstSize = 100
+	rateLimitConfig.PerIPRequestsPerSecond = 10
+	rateLimitConfig.PerIPBurstSize = 20
+
 	// Create middlewares
 	authMiddleware := middleware.NewAuthMiddleware(authConfig)
 	aclMiddleware := middleware.NewACLMiddleware(aclConfig)
+	rateLimitMiddleware := middleware.NewRateLimitMiddleware(rateLimitConfig)
 
 	// Create admin handler
 	adminHandler := NewAdminHandler(aclConfig)
@@ -119,20 +128,20 @@ func NewServer(port, httpsPort string, authConfig *middleware.AuthConfig, tlsCon
 		}
 	})
 
-	// Apply auth middleware to admin routes
-	mux.Handle("/admin/", authMiddleware.Middleware(adminMux))
+	// Apply auth and rate limit middleware to admin routes
+	mux.Handle("/admin/", authMiddleware.Middleware(rateLimitMiddleware.Middleware(adminMux)))
 
-	// Protected endpoints (authentication + ACL required)
+	// Protected endpoints (authentication + ACL + rate limiting required)
 	peerMux := http.NewServeMux()
 	peerMux.HandleFunc("/peer/", handlePeerRequest)
 
-	// Apply auth and ACL middleware to peer routes
-	mux.Handle("/peer/", authMiddleware.Middleware(aclMiddleware.Middleware(peerMux)))
+	// Apply auth, rate limit, and ACL middleware to peer routes
+	mux.Handle("/peer/", authMiddleware.Middleware(rateLimitMiddleware.Middleware(aclMiddleware.Middleware(peerMux))))
 
-	// Auth validation endpoint (authentication only, no ACL)
+	// Auth validation endpoint (authentication + rate limiting only, no ACL)
 	authValidateMux := http.NewServeMux()
 	authValidateMux.HandleFunc("/auth/validate", handleAuthValidate)
-	mux.Handle("/auth/validate", authMiddleware.Middleware(authValidateMux))
+	mux.Handle("/auth/validate", authMiddleware.Middleware(rateLimitMiddleware.Middleware(authValidateMux)))
 
 	// Create HTTP server
 	httpServer := &http.Server{
