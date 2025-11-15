@@ -1,0 +1,178 @@
+groups:
+  - name: portal_gateway_alerts
+    interval: 30s
+    rules:
+      # High Error Rate Alert
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(portal_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(portal_requests_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          component: gateway
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+          runbook: "https://docs.portal-gateway.io/runbooks/high-error-rate"
+
+      # High Latency Alert
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(portal_request_duration_seconds_bucket[5m])) by (le)
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "High request latency detected"
+          description: "P95 latency is {{ $value }}s (threshold: 5s)"
+          runbook: "https://docs.portal-gateway.io/runbooks/high-latency"
+
+      # Very High Latency Alert
+      - alert: VeryHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(portal_request_duration_seconds_bucket[5m])) by (le)
+          ) > 10
+        for: 5m
+        labels:
+          severity: critical
+          component: gateway
+        annotations:
+          summary: "Very high request latency detected"
+          description: "P95 latency is {{ $value }}s (threshold: 10s)"
+          runbook: "https://docs.portal-gateway.io/runbooks/high-latency"
+
+      # Connection Spike Alert
+      - alert: ConnectionSpike
+        expr: portal_active_connections > 1000
+        for: 5m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "Connection spike detected"
+          description: "Active connections: {{ $value }} (threshold: 1000)"
+          runbook: "https://docs.portal-gateway.io/runbooks/connection-spike"
+
+      # Critical Connection Spike Alert
+      - alert: CriticalConnectionSpike
+        expr: portal_active_connections > 5000
+        for: 2m
+        labels:
+          severity: critical
+          component: gateway
+        annotations:
+          summary: "Critical connection spike detected"
+          description: "Active connections: {{ $value }} (threshold: 5000)"
+          runbook: "https://docs.portal-gateway.io/runbooks/connection-spike"
+
+      # Quota Exceeded Alert
+      - alert: QuotaExceeded
+        expr: rate(portal_quota_exceeded_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "Quota exceeded events detected"
+          description: "Quota exceeded rate: {{ $value }}/s for {{ $labels.key_id }}"
+          runbook: "https://docs.portal-gateway.io/runbooks/quota-exceeded"
+
+      # AI Agent High Error Rate
+      - alert: AIAgentHighErrorRate
+        expr: |
+          (
+            sum(rate(portal_ai_agent_errors_total[5m])) by (agent_type)
+            /
+            sum(rate(portal_ai_agent_requests_total[5m])) by (agent_type)
+          ) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+          component: ai_agent
+        annotations:
+          summary: "High AI agent error rate detected"
+          description: "Error rate for {{ $labels.agent_type }} is {{ $value | humanizePercentage }} (threshold: 10%)"
+          runbook: "https://docs.portal-gateway.io/runbooks/ai-agent-errors"
+
+      # AI Agent High Latency
+      - alert: AIAgentHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(portal_ai_agent_latency_seconds_bucket[5m])) by (le, agent_type)
+          ) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: ai_agent
+        annotations:
+          summary: "High AI agent latency detected"
+          description: "P95 latency for {{ $labels.agent_type }} is {{ $value }}s (threshold: 10s)"
+          runbook: "https://docs.portal-gateway.io/runbooks/ai-agent-latency"
+
+      # Rate Limit Hit Spike
+      - alert: RateLimitHitSpike
+        expr: rate(portal_rate_limit_hits_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: info
+          component: gateway
+        annotations:
+          summary: "Rate limit hit spike detected"
+          description: "Rate limit hits: {{ $value }}/s for {{ $labels.limit_type }}"
+          runbook: "https://docs.portal-gateway.io/runbooks/rate-limit-hits"
+
+      # No Active Connections (Potential Outage)
+      - alert: NoActiveConnections
+        expr: portal_active_connections == 0
+        for: 10m
+        labels:
+          severity: critical
+          component: gateway
+        annotations:
+          summary: "No active connections detected"
+          description: "Gateway has no active connections for 10 minutes - potential outage"
+          runbook: "https://docs.portal-gateway.io/runbooks/no-connections"
+
+      # High Request Rate
+      - alert: HighRequestRate
+        expr: sum(rate(portal_requests_total[5m])) > 10000
+        for: 5m
+        labels:
+          severity: info
+          component: gateway
+        annotations:
+          summary: "High request rate detected"
+          description: "Request rate: {{ $value }}/s (threshold: 10000/s)"
+          runbook: "https://docs.portal-gateway.io/runbooks/high-request-rate"
+
+      # Memory Usage Warning (if process metrics available)
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes > 2e9
+        for: 10m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "High memory usage detected"
+          description: "Memory usage: {{ $value | humanize1024 }}B (threshold: 2GB)"
+          runbook: "https://docs.portal-gateway.io/runbooks/high-memory"
+
+      # Gateway Down
+      - alert: GatewayDown
+        expr: up{job="portal-gateway"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: gateway
+        annotations:
+          summary: "Portal Gateway is down"
+          description: "Gateway instance {{ $labels.instance }} is unreachable"
+          runbook: "https://docs.portal-gateway.io/runbooks/gateway-down"
