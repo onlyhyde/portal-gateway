@@ -25,6 +25,7 @@ const (
 type Server struct {
 	httpServer *http.Server
 	authConfig *middleware.AuthConfig
+	aclConfig  *middleware.ACLConfig
 }
 
 func main() {
@@ -54,21 +55,55 @@ func main() {
 func NewServer(port string, authConfig *middleware.AuthConfig) *Server {
 	mux := http.NewServeMux()
 
-	// Create auth middleware
+	// Create ACL configuration
+	aclConfig := middleware.NewACLConfig()
+
+	// Create middlewares
 	authMiddleware := middleware.NewAuthMiddleware(authConfig)
+	aclMiddleware := middleware.NewACLMiddleware(aclConfig)
+
+	// Create admin handler
+	adminHandler := NewAdminHandler(aclConfig)
 
 	// Public endpoints (no authentication required)
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/", handleRoot)
 
-	// Protected endpoints (authentication required)
-	protectedMux := http.NewServeMux()
-	protectedMux.HandleFunc("/peer/", handlePeerRequest)
-	protectedMux.HandleFunc("/auth/validate", handleAuthValidate)
+	// Admin endpoints (authentication + admin scope required)
+	adminMux := http.NewServeMux()
+	adminMux.HandleFunc("/admin/acl", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/admin/acl" {
+			adminHandler.HandleListACLRules(w, r)
+		} else if r.Method == http.MethodPost {
+			adminHandler.HandleAddACLRule(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	adminMux.HandleFunc("/admin/acl/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			adminHandler.HandleGetACLRule(w, r)
+		} else if r.Method == http.MethodDelete {
+			adminHandler.HandleRemoveACLRule(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
 
-	// Apply auth middleware to protected routes
-	mux.Handle("/peer/", authMiddleware.Middleware(protectedMux))
-	mux.Handle("/auth/validate", authMiddleware.Middleware(protectedMux))
+	// Apply auth middleware to admin routes
+	mux.Handle("/admin/", authMiddleware.Middleware(adminMux))
+
+	// Protected endpoints (authentication + ACL required)
+	peerMux := http.NewServeMux()
+	peerMux.HandleFunc("/peer/", handlePeerRequest)
+
+	// Apply auth and ACL middleware to peer routes
+	mux.Handle("/peer/", authMiddleware.Middleware(aclMiddleware.Middleware(peerMux)))
+
+	// Auth validation endpoint (authentication only, no ACL)
+	authValidateMux := http.NewServeMux()
+	authValidateMux.HandleFunc("/auth/validate", handleAuthValidate)
+	mux.Handle("/auth/validate", authMiddleware.Middleware(authValidateMux))
 
 	// Create HTTP server
 	httpServer := &http.Server{
@@ -82,6 +117,7 @@ func NewServer(port string, authConfig *middleware.AuthConfig) *Server {
 	return &Server{
 		httpServer: httpServer,
 		authConfig: authConfig,
+		aclConfig:  aclConfig,
 	}
 }
 
@@ -143,12 +179,21 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"service":"portal-gateway","version":"0.1.0","status":"running"}`)
 }
 
-// handlePeerRequest handles peer relay requests (requires authentication)
+// handlePeerRequest handles peer relay requests (requires authentication + ACL)
 func handlePeerRequest(w http.ResponseWriter, r *http.Request) {
 	// Get API key info from context
 	apiKeyInfo := middleware.GetAPIKeyInfo(r.Context())
 	if apiKeyInfo == nil {
 		http.Error(w, "Authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	// Get lease ID from context (set by ACL middleware)
+	leaseID := middleware.GetLeaseID(r.Context())
+	if leaseID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"error":"invalid_lease_id","message":"Lease ID is required"}`)
 		return
 	}
 
@@ -163,7 +208,7 @@ func handlePeerRequest(w http.ResponseWriter, r *http.Request) {
 	// TODO: Implement actual peer relay logic
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"message":"Peer relay endpoint (implementation pending)","authenticated_as":"%s"}`, apiKeyInfo.KeyID)
+	fmt.Fprintf(w, `{"message":"Peer relay endpoint (implementation pending)","authenticated_as":"%s","lease_id":"%s"}`, apiKeyInfo.KeyID, leaseID)
 }
 
 // handleAuthValidate handles API key validation requests (requires authentication)
